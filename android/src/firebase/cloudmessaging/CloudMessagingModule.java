@@ -176,16 +176,45 @@ public class CloudMessagingModule extends KrollModule {
         });
     }
 
-// Mesma coisa para unsubscribeFromTopic
-
     @Kroll.method
-    public void unsubscribeFromTopic(String topic) {
+    public void unsubscribeFromTopic(String topic, @Kroll.argument(optional = true) KrollFunction callback) {
+
+        if (topic == null || topic.isEmpty()) {
+            Log.e(LCAT, "Topic cannot be null or empty");
+            KrollDict error = new KrollDict();
+            error.put("success", false);
+            error.put("error", "Invalid topic");
+            fireEvent("unsubscribe", error);
+            return;
+        }
+
+        // Validar formato do tópico
+        if (!topic.matches("^[a-zA-Z0-9-_.~%]+$")) {
+            Log.e(LCAT, "Invalid topic format");
+            KrollDict error = new KrollDict();
+            error.put("success", false);
+            error.put("error", "Topic must match [a-zA-Z0-9-_.~%]+");
+            fireEvent("unsubscribe", error);
+            return;
+        }
+
         FirebaseMessaging.getInstance().unsubscribeFromTopic(topic).addOnCompleteListener(task -> {
             KrollDict data = new KrollDict();
             data.put("success", task.isSuccessful());
+            data.put("topic", topic);
+
+            if (!task.isSuccessful()) {
+                data.put("error", task.getException() != null ?
+                        task.getException().getMessage() : "Unknown error");
+            }
+
             fireEvent("unsubscribe", data);
+            Log.d(LCAT, "unsubscribe from " + topic);
+
+            if (callback != null) {
+                callback.callAsync(getKrollObject(), data);
+            }
         });
-        Log.d(LCAT, "unsubscribe from " + topic);
     }
 
     @Kroll.method

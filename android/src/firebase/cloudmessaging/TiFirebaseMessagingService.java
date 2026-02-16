@@ -369,7 +369,7 @@ public class TiFirebaseMessagingService extends FirebaseMessagingService {
             try {
                 JSONArray actionsArray = new JSONArray(actionsValue);
 
-                for (int i = 0; i < actionsArray.length(); i++) {
+                for (int i = 0; i < Math.min(actionsArray.length(), 3); i++) {
                     JSONObject actionObj = actionsArray.getJSONObject(i);
                     String actionId = actionObj.getString("id");
                     String actionTitle = actionObj.getString("title");
@@ -420,18 +420,34 @@ public class TiFirebaseMessagingService extends FirebaseMessagingService {
     }
 
     private Bitmap getBitmapFromURL(String imageUrl) {
+        HttpURLConnection connection = null;
+        InputStream input = null;
+
         try {
             URL url = new URL(imageUrl);
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection = (HttpURLConnection) url.openConnection();
             connection.setDoInput(true);
             connection.setConnectTimeout(5000);
-            connection.setReadTimeout(5000);
+            connection.setReadTimeout(10000);
             connection.connect();
-            InputStream input = connection.getInputStream();
+
+            input = new BufferedInputStream(connection.getInputStream());
             return BitmapFactory.decodeStream(input);
+
         } catch (Exception e) {
             Log.e(TAG, "Error loading notification image", e);
             return null;
+
+        } finally {
+            try {
+                if (input != null) input.close();
+            } catch (Exception e) {
+                Log.e(TAG, "Error closing input stream", e);
+            }
+
+            if (connection != null) {
+                connection.disconnect();
+            }
         }
     }
 
