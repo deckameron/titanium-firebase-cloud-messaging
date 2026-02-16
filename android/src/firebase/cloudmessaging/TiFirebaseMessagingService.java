@@ -24,10 +24,12 @@ import org.appcelerator.kroll.KrollDict;
 import org.appcelerator.titanium.TiApplication;
 import org.appcelerator.titanium.util.TiConvert;
 import org.appcelerator.titanium.util.TiRHelper;
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
+import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.HashMap;
@@ -41,13 +43,21 @@ public class TiFirebaseMessagingService extends FirebaseMessagingService {
     private static final AtomicInteger atomic = new AtomicInteger(0);
 
     @Override
-    public void onNewToken(@NonNull String s) {
-        super.onNewToken(s);
+    public void onNewToken(@NonNull String token) {
+        super.onNewToken(token);
+        Log.d(TAG, "Refreshed FCM token: " + token);
+
+        // Persistir o token
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(getApplicationContext());
+        prefs.edit().putString("fcm_token", token).apply();
+
+        // Notificar o módulo
         CloudMessagingModule module = CloudMessagingModule.getInstance();
         if (module != null) {
-            module.onTokenRefresh(s);
+            module.onTokenRefresh(token);
+        } else {
+            Log.w(TAG, "CloudMessagingModule instance is null, storing token for later");
         }
-        Log.d(TAG, "New token: " + s);
     }
 
     /**
@@ -68,6 +78,19 @@ public class TiFirebaseMessagingService extends FirebaseMessagingService {
                     .invoke(null, context, remoteMessage);
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    @Override
+    public void onDeletedMessages() {
+        super.onDeletedMessages();
+        Log.w(TAG, "Messages were deleted on server - too many messages queued");
+
+        CloudMessagingModule module = CloudMessagingModule.getInstance();
+        if (module != null) {
+            HashMap<String, Object> data = new HashMap<>();
+            data.put("messagesDeleted", true);
+            module.fireEvent("messagesDeleted", new KrollDict(data));
         }
     }
 
@@ -340,6 +363,44 @@ public class TiFirebaseMessagingService extends FirebaseMessagingService {
             builder.setNumber(badgeNumber);
         }
 
+        // Notification Actions (botões)
+        String actionsValue = getString(params, "actions");
+        if (!actionsValue.isEmpty()) {
+            try {
+                JSONArray actionsArray = new JSONArray(actionsValue);
+
+                for (int i = 0; i < actionsArray.length(); i++) {
+                    JSONObject actionObj = actionsArray.getJSONObject(i);
+                    String actionId = actionObj.getString("id");
+                    String actionTitle = actionObj.getString("title");
+
+                    // Criar intent para a action
+                    Intent actionIntent = new Intent(this, NotificationActionReceiver.class);
+                    actionIntent.setAction("firebase.cloudmessaging.ACTION_" + actionId);
+                    actionIntent.putExtra("action_id", actionId);
+                    actionIntent.putExtra("fcm_data", jsonData.toString());
+
+                    PendingIntent actionPendingIntent = PendingIntent.getBroadcast(
+                            this,
+                            actionId.hashCode(), // Unique request code
+                            actionIntent,
+                            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                    );
+
+                    int iconResId = 0;
+                    String iconName = actionObj.optString("icon", "");
+                    if (!iconName.isEmpty()) {
+                        iconResId = getResource(iconName);
+                    }
+                    builder.addAction(iconResId, actionTitle, actionPendingIntent);
+
+                    Log.d(TAG, "Added action: " + actionId + " - " + actionTitle);
+                }
+            } catch (JSONException e) {
+                Log.e(TAG, "Error parsing actions: " + e.getMessage());
+            }
+        }
+
         int id = 0;
         String idValue = getString(params, "id");
         if (!idValue.isEmpty()) {
@@ -358,12 +419,20 @@ public class TiFirebaseMessagingService extends FirebaseMessagingService {
         return true;
     }
 
-    private Bitmap getBitmapFromURL(String src) throws Exception {
-        HttpURLConnection connection = (HttpURLConnection) (new URL(src)).openConnection();
-        connection.setDoInput(true);
-        connection.setUseCaches(false); // Android BUG
-        connection.connect();
-        return BitmapFactory.decodeStream(new BufferedInputStream(connection.getInputStream()));
+    private Bitmap getBitmapFromURL(String imageUrl) {
+        try {
+            URL url = new URL(imageUrl);
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setDoInput(true);
+            connection.setConnectTimeout(5000);
+            connection.setReadTimeout(5000);
+            connection.connect();
+            InputStream input = connection.getInputStream();
+            return BitmapFactory.decodeStream(input);
+        } catch (Exception e) {
+            Log.e(TAG, "Error loading notification image", e);
+            return null;
+        }
     }
 
     private int getResource(String name) {

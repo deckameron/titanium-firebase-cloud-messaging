@@ -9,6 +9,10 @@ package firebase.cloudmessaging;
 
 import static firebase.cloudmessaging.Utils.getApplicationContext;
 
+import com.google.android.gms.common.GoogleApiAvailability;
+import com.google.android.gms.common.ConnectionResult;
+
+import android.app.Activity;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.content.Context;
@@ -20,13 +24,17 @@ import android.media.RingtoneManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
+import android.provider.Settings;
 
+import androidx.core.app.NotificationManagerCompat;
 import androidx.preference.PreferenceManager;
 
 import com.google.firebase.messaging.FirebaseMessaging;
 import com.google.firebase.messaging.RemoteMessage;
 
 import org.appcelerator.kroll.KrollDict;
+import org.appcelerator.kroll.KrollFunction;
 import org.appcelerator.kroll.KrollModule;
 import org.appcelerator.kroll.annotations.Kroll;
 import org.appcelerator.kroll.common.Log;
@@ -35,6 +43,7 @@ import org.appcelerator.titanium.util.TiConvert;
 import org.json.JSONObject;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import ti.modules.titanium.android.notificationmanager.NotificationChannelProxy;
@@ -127,14 +136,47 @@ public class CloudMessagingModule extends KrollModule {
     }
 
     @Kroll.method
-    public void subscribeToTopic(String topic) {
+    public void subscribeToTopic(String topic, @Kroll.argument(optional = true) KrollFunction callback) {
+
+        if (topic == null || topic.isEmpty()) {
+            Log.e(LCAT, "Topic cannot be null or empty");
+            KrollDict error = new KrollDict();
+            error.put("success", false);
+            error.put("error", "Invalid topic");
+            fireEvent("subscribe", error);
+            return;
+        }
+
+        // Validar formato do tópico (FCM tem regras)
+        if (!topic.matches("^[a-zA-Z0-9-_.~%]+$")) {
+            Log.e(LCAT, "Invalid topic format");
+            KrollDict error = new KrollDict();
+            error.put("success", false);
+            error.put("error", "Topic must match [a-zA-Z0-9-_.~%]+");
+            fireEvent("subscribe", error);
+            return;
+        }
+
         FirebaseMessaging.getInstance().subscribeToTopic(topic).addOnCompleteListener(task -> {
             KrollDict data = new KrollDict();
             data.put("success", task.isSuccessful());
+            data.put("topic", topic);
+
+            if (!task.isSuccessful()) {
+                data.put("error", task.getException() != null ?
+                        task.getException().getMessage() : "Unknown error");
+            }
+
             fireEvent("subscribe", data);
+            Log.d(LCAT, "subscribe to " + topic);
+
+            if (callback != null) {
+                callback.callAsync(getKrollObject(), data);
+            }
         });
-        Log.d(LCAT, "subscribe to " + topic);
     }
+
+// Mesma coisa para unsubscribeFromTopic
 
     @Kroll.method
     public void unsubscribeFromTopic(String topic) {
@@ -165,15 +207,44 @@ public class CloudMessagingModule extends KrollModule {
         }
     }
 
+    private long lastTokenRequest = 0;
+    private static final long TOKEN_REQUEST_THROTTLE = 5000;
+
     @Kroll.method
     public void getToken() {
+
+        long now = System.currentTimeMillis();
+        if (now - lastTokenRequest < TOKEN_REQUEST_THROTTLE) {
+            Log.d(LCAT, "Token request throttled");
+            return;
+        }
+        lastTokenRequest = now;
+
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(getApplicationContext());
+        String cachedToken = prefs.getString("fcm_token", null);
+
+        if (cachedToken != null && !cachedToken.isEmpty()) {
+            fcmToken = cachedToken;
+            KrollDict data = new KrollDict();
+            data.put("fcmToken", fcmToken);
+            fireEvent("didRefreshRegistrationToken", data);
+        }
+
+        // Depois busca o token atualizado do Firebase
         FirebaseMessaging fm = FirebaseMessaging.getInstance();
         fm.getToken().addOnCompleteListener(task -> {
             if (task.isSuccessful()) {
+                String token = task.getResult();
+                fcmToken = token;
+
+                // Salvar na SharedPreferences
+                prefs.edit().putString("fcm_token", token).apply();
+
                 KrollDict data = new KrollDict();
-                fcmToken = task.getResult();
-                data.put("fcmToken", fcmToken);
+                data.put("fcmToken", token);
                 fireEvent("didRefreshRegistrationToken", data);
+            } else {
+                Log.e(LCAT, "Failed to get FCM token", task.getException());
             }
         });
     }
@@ -287,8 +358,7 @@ public class CloudMessagingModule extends KrollModule {
                     .build();
             channel.setSound(soundUri, audioAttributes);
         }
-        NotificationManager notificationManager =
-                (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+        NotificationManager notificationManager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
         assert notificationManager != null;
         notificationManager.createNotificationChannel(channel);
     }
@@ -309,16 +379,23 @@ public class CloudMessagingModule extends KrollModule {
 
     @Kroll.getProperty
     public String fcmToken() {
-        if (fcmToken != null) {
+        if (fcmToken != null && !fcmToken.isEmpty()) {
             return fcmToken;
-        } else {
+        }
+
+        // Tenta recuperar da SharedPreferences
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(getApplicationContext());
+        fcmToken = prefs.getString("fcm_token", null);
+
+        if (fcmToken == null || fcmToken.isEmpty()) {
             getToken();
             return null;
         }
+
+        return fcmToken;
     }
 
     // clang-format off
-    @Kroll.setProperty
     @Kroll.method
     public void setNotificationChannel(Object channel)
     // clang-format on
@@ -378,5 +455,189 @@ public class CloudMessagingModule extends KrollModule {
 
         SharedPreferences preferences = PreferenceManager.getDefaultSharedPreferences(getApplicationContext());
         preferences.edit().remove("titanium.firebase.cloudmessaging.message").apply();
+    }
+
+    @Kroll.method
+    public boolean isIgnoringBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            String packageName = getApplicationContext().getPackageName();
+            PowerManager pm = (PowerManager) getApplicationContext().getSystemService(Context.POWER_SERVICE);
+            return pm.isIgnoringBatteryOptimizations(packageName);
+        }
+        return true;
+    }
+
+    @Kroll.method
+    public void requestIgnoreBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                Intent intent = new Intent();
+                String packageName = getApplicationContext().getPackageName();
+                PowerManager pm = (PowerManager) getApplicationContext().getSystemService(Context.POWER_SERVICE);
+
+                if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                    intent.setAction(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                    intent.setData(Uri.parse("package:" + packageName));
+                    intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    getApplicationContext().startActivity(intent);
+                }
+            } catch (Exception e) {
+                Log.e(LCAT, "Error requesting battery optimization exemption", e);
+            }
+        }
+    }
+
+    @Kroll.method
+    public KrollDict checkPlayServices() {
+        KrollDict result = new KrollDict();
+
+        GoogleApiAvailability apiAvailability = GoogleApiAvailability.getInstance();
+        int resultCode = apiAvailability.isGooglePlayServicesAvailable(getApplicationContext());
+
+        result.put("available", resultCode == ConnectionResult.SUCCESS);
+        result.put("resultCode", resultCode);
+        result.put("errorString", apiAvailability.getErrorString(resultCode));
+        result.put("isUserResolvableError", apiAvailability.isUserResolvableError(resultCode));
+
+        return result;
+    }
+
+    @Kroll.method
+    public void showPlayServicesErrorDialog() {
+        GoogleApiAvailability apiAvailability = GoogleApiAvailability.getInstance();
+        int resultCode = apiAvailability.isGooglePlayServicesAvailable(getApplicationContext());
+
+        if (resultCode != ConnectionResult.SUCCESS) {
+            if (apiAvailability.isUserResolvableError(resultCode)) {
+                Activity activity = TiApplication.getAppRootOrCurrentActivity();
+                apiAvailability.getErrorDialog(activity, resultCode, 9000).show();
+            }
+        }
+    }
+
+    @Kroll.method
+    public boolean areNotificationsEnabled() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationManager manager = (NotificationManager)
+                    getApplicationContext().getSystemService(Context.NOTIFICATION_SERVICE);
+
+            if (!manager.areNotificationsEnabled()) {
+                return false;
+            }
+
+            // Verificar se o canal específico está habilitado
+            String channelId = "fcm_alert_v3"; // ou pegar de SharedPreferences
+            NotificationChannel channel = manager.getNotificationChannel(channelId);
+
+            return channel != null && channel.getImportance() != NotificationManager.IMPORTANCE_NONE;
+        } else {
+            return NotificationManagerCompat.from(getApplicationContext()).areNotificationsEnabled();
+        }
+    }
+
+    @Kroll.method
+    public void openNotificationSettings() {
+        Intent intent = new Intent();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            intent.setAction(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+            intent.putExtra(Settings.EXTRA_APP_PACKAGE, getApplicationContext().getPackageName());
+        } else {
+            intent.setAction(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+            intent.setData(Uri.parse("package:" + getApplicationContext().getPackageName()));
+        }
+
+        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        getApplicationContext().startActivity(intent);
+    }
+
+    @Kroll.method
+    public Object[] fetchNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            return new Object[0];
+        }
+
+        NotificationManager manager = (NotificationManager)
+                getApplicationContext().getSystemService(Context.NOTIFICATION_SERVICE);
+
+        List<NotificationChannel> channels = manager.getNotificationChannels();
+        KrollDict[] result = new KrollDict[channels.size()];
+
+        for (int i = 0; i < channels.size(); i++) {
+            NotificationChannel channel = channels.get(i);
+            KrollDict channelDict = new KrollDict();
+            channelDict.put("id", channel.getId());
+            channelDict.put("name", channel.getName());
+            channelDict.put("importance", channel.getImportance());
+            channelDict.put("description", channel.getDescription());
+            channelDict.put("vibrationEnabled", channel.shouldVibrate());
+            channelDict.put("lightsEnabled", channel.shouldShowLights());
+            channelDict.put("badgeEnabled", channel.canShowBadge());
+            result[i] = channelDict;
+        }
+
+        return result;
+    }
+
+    @Kroll.method
+    public KrollDict getNotificationChannel(String channelId) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            return null;
+        }
+
+        NotificationManager manager = (NotificationManager)
+                getApplicationContext().getSystemService(Context.NOTIFICATION_SERVICE);
+
+        NotificationChannel channel = manager.getNotificationChannel(channelId);
+        if (channel == null) return null;
+
+        KrollDict result = new KrollDict();
+        result.put("id", channel.getId());
+        result.put("name", channel.getName());
+        result.put("importance", channel.getImportance());
+        result.put("description", channel.getDescription());
+        result.put("vibrationEnabled", channel.shouldVibrate());
+        result.put("lightsEnabled", channel.shouldShowLights());
+        result.put("badgeEnabled", channel.canShowBadge());
+
+        return result;
+    }
+
+    @Kroll.method
+    public void cancelNotification(int notificationId) {
+        NotificationManager manager = (NotificationManager)
+                getApplicationContext().getSystemService(Context.NOTIFICATION_SERVICE);
+        manager.cancel(notificationId);
+    }
+
+    @Kroll.method
+    public void cancelAllNotifications() {
+        NotificationManager manager = (NotificationManager)
+                getApplicationContext().getSystemService(Context.NOTIFICATION_SERVICE);
+        manager.cancelAll();
+    }
+
+    @Kroll.method
+    public int getActiveNotificationsCount() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            NotificationManager manager = (NotificationManager)
+                    getApplicationContext().getSystemService(Context.NOTIFICATION_SERVICE);
+            return manager.getActiveNotifications().length;
+        }
+        return -1; // Not available
+    }
+
+    @Kroll.method
+    public KrollDict getDeliveryStats() {
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(getApplicationContext());
+
+        KrollDict stats = new KrollDict();
+        stats.put("totalReceived", prefs.getInt("fcm_total_received", 0));
+        stats.put("receivedInForeground", prefs.getInt("fcm_foreground_received", 0));
+        stats.put("receivedInBackground", prefs.getInt("fcm_background_received", 0));
+        stats.put("lastReceivedAt", prefs.getLong("fcm_last_received", 0));
+        stats.put("tokenRefreshCount", prefs.getInt("fcm_token_refresh_count", 0));
+
+        return stats;
     }
 }
